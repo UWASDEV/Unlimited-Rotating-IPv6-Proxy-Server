@@ -35,7 +35,7 @@ It works by binding otherwise-unassigned addresses (`net.ipv6.ip_nonlocal_bind`)
 ## Install
 
 ```bash
-git clone https://github.com/<you>/unlimited-rotating-ipv6-proxy
+git clone https://github.com/UWASDEV/unlimited-rotating-ipv6-proxy
 cd unlimited-rotating-ipv6-proxy
 sudo bash install.sh
 ```
