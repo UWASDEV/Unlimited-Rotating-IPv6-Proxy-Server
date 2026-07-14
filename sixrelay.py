@@ -1,0 +1,317 @@
+#!/usr/bin/env python3
+"""sixrelay - session-based rotating IPv6 SOCKS5 proxy.
+
+Every accepted client connection is assigned a uniform-random source address
+from the configured IPv6 subnet and that address is bound to the upstream
+socket. The address is held for the whole lifetime of the TCP session and
+released on close. An in-use set guarantees that no two *concurrent*
+connections ever share a source address, so simultaneous connections always
+egress from distinct IPv6 addresses.
+
+Egress is IPv6-only by design. Binding a non-assigned address relies on
+net.ipv6.ip_nonlocal_bind=1 (plus IPV6_FREEBIND); the whole subnet is
+delivered locally via `ip -6 route replace local <subnet> dev <if>` and ndppd
+answers NDP for it, so return traffic reaches the bound socket without the
+address being configured on the interface.
+
+All configuration comes from the environment (see /etc/sixrelay/sixrelay.env).
+"""
+import asyncio
+import hmac
+import ipaddress
+import logging
+import os
+import secrets
+import socket
+import struct
+import sys
+
+
+def _require(name):
+    v = os.environ.get(name)
+    if not v:
+        sys.stderr.write(f"sixrelay: required env {name} is not set\n")
+        raise SystemExit(2)
+    return v
+
+
+LISTEN_HOST = os.environ.get("SIXRELAY_LISTEN_HOST", "0.0.0.0")
+LISTEN_PORT = int(os.environ.get("SIXRELAY_LISTEN_PORT", "1080"))
+SUBNET = ipaddress.IPv6Network(_require("SIXRELAY_SUBNET"), strict=False)
+PROXY_USER = _require("SIXRELAY_USER").encode()
+PROXY_PASS = _require("SIXRELAY_PASS").encode()
+CONNECT_TIMEOUT = float(os.environ.get("SIXRELAY_CONNECT_TIMEOUT", "15"))
+HANDSHAKE_TIMEOUT = float(os.environ.get("SIXRELAY_HANDSHAKE_TIMEOUT", "10"))
+IDLE_TIMEOUT = float(os.environ.get("SIXRELAY_IDLE_TIMEOUT", "300"))
+MAX_SESSIONS = int(os.environ.get("SIXRELAY_MAX_SESSIONS", "2000"))
+BUF = 65536
+
+IPV6_FREEBIND = getattr(socket, "IPV6_FREEBIND", 78)
+
+_PREFIX_INT = int(SUBNET.network_address)
+_HOST_BITS = 128 - SUBNET.prefixlen
+_HOSTMASK = (1 << _HOST_BITS) - 1 if _HOST_BITS else 0
+
+
+def _parse_reserved(spec):
+    """Host parts never handed out. Accepts comma-separated host-part ints
+    (decimal or 0x..) and/or full IPv6 addresses (reduced to their host part)."""
+    out = {0, 1}  # subnet-router anycast + the conventional ::1 gateway
+    for tok in spec.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            out.add(int(tok, 0) & _HOSTMASK)
+            continue
+        except ValueError:
+            pass
+        try:
+            out.add(int(ipaddress.IPv6Address(tok)) & _HOSTMASK)
+        except ValueError:
+            logging.getLogger("sixrelay").warning("ignoring bad reserved token %r", tok)
+    return out
+
+
+_RESERVED = _parse_reserved(os.environ.get("SIXRELAY_RESERVED", ""))
+
+log = logging.getLogger("sixrelay")
+_inuse = set()
+_active = 0  # live sessions; single-threaded event loop => no lock needed
+
+
+# ---- Source-address pool -----------------------------------------------------
+def pick_source():
+    """Reserve and return a random, currently-unused host part of the subnet.
+
+    Bounded retry so a saturated/degenerate pool can never spin forever.
+    """
+    for _ in range(64):
+        host = secrets.randbits(_HOST_BITS) if _HOST_BITS else 0
+        if host in _RESERVED or host in _inuse:
+            continue
+        _inuse.add(host)
+        return host
+    raise RuntimeError("source pool saturated")
+
+
+def release_source(host):
+    _inuse.discard(host)
+
+
+def host_to_addr(host):
+    return str(ipaddress.IPv6Address(_PREFIX_INT | (host & _HOSTMASK)))
+
+
+def _pack_addrport(addr, port):
+    """Encode a bound address/port into a SOCKS5 reply body (ATYP+addr+port)."""
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        ip = None
+    if isinstance(ip, ipaddress.IPv6Address):
+        return b"\x04" + ip.packed + struct.pack("!H", port)
+    if isinstance(ip, ipaddress.IPv4Address):
+        return b"\x01" + ip.packed + struct.pack("!H", port)
+    return b"\x01\x00\x00\x00\x00" + struct.pack("!H", port)
+
+
+# ---- SOCKS5 -----------------------------------------------------------------
+async def socks5_handshake(reader, writer):
+    """Method negotiation + username/password auth (RFC 1928 / RFC 1929)."""
+    ver, nmethods = await reader.readexactly(2)
+    if ver != 0x05:
+        return False
+    methods = await reader.readexactly(nmethods)
+    if 0x02 not in methods:  # require username/password
+        writer.write(b"\x05\xff")
+        await writer.drain()
+        return False
+    writer.write(b"\x05\x02")
+    await writer.drain()
+
+    (auth_ver,) = await reader.readexactly(1)
+    if auth_ver != 0x01:
+        return False
+    (ulen,) = await reader.readexactly(1)
+    username = await reader.readexactly(ulen)
+    (plen,) = await reader.readexactly(1)
+    password = await reader.readexactly(plen)
+    ok = hmac.compare_digest(username, PROXY_USER)
+    ok = hmac.compare_digest(password, PROXY_PASS) and ok
+    if not ok:
+        writer.write(b"\x01\x01")
+        await writer.drain()
+        return False
+    writer.write(b"\x01\x00")
+    await writer.drain()
+    return True
+
+
+async def socks5_read_request(reader):
+    """Return (host, port) for a CONNECT, or raise ValueError(<int reply code>)."""
+    ver, cmd, _rsv, atyp = await reader.readexactly(4)
+    if ver != 0x05:
+        raise ValueError(0x01)
+    if cmd != 0x01:                     # only CONNECT (TCP) is supported
+        raise ValueError(0x07)
+    if atyp == 0x01:                    # IPv4 literal: no IPv6 egress path
+        await reader.readexactly(4)
+        await reader.readexactly(2)
+        raise ValueError(0x08)
+    if atyp == 0x03:                    # domain
+        (dlen,) = await reader.readexactly(1)
+        raw = await reader.readexactly(dlen)
+        try:
+            host = raw.decode("ascii")
+        except UnicodeError:
+            raise ValueError(0x08)
+    elif atyp == 0x04:                  # IPv6 literal
+        host = str(ipaddress.IPv6Address(await reader.readexactly(16)))
+    else:
+        raise ValueError(0x08)
+    (port,) = struct.unpack("!H", await reader.readexactly(2))
+    return host, port
+
+
+async def open_upstream(loop, host, port, source_host):
+    """Resolve AAAA, bind the chosen subnet source, connect. Returns a connected
+    AF_INET6 socket. Raises OSError / asyncio.TimeoutError on failure."""
+    infos = await loop.getaddrinfo(
+        host, port, family=socket.AF_INET6, type=socket.SOCK_STREAM
+    )
+    if not infos:
+        raise OSError("no AAAA")
+    src = host_to_addr(source_host)
+    last = None
+    for family, socktype, proto, _canon, sa in infos:
+        sock = socket.socket(family, socktype, proto)
+        try:
+            sock.setblocking(False)
+            try:
+                sock.setsockopt(socket.IPPROTO_IPV6, IPV6_FREEBIND, 1)
+            except OSError:
+                pass  # global net.ipv6.ip_nonlocal_bind=1 already permits it
+            sock.bind((src, 0))
+            await asyncio.wait_for(loop.sock_connect(sock, sa), CONNECT_TIMEOUT)
+            return sock
+        except (OSError, asyncio.TimeoutError) as exc:
+            last = exc
+            sock.close()
+    raise last if last else OSError("connect failed")
+
+
+async def pipe(reader, writer):
+    try:
+        while True:
+            data = await asyncio.wait_for(reader.read(BUF), IDLE_TIMEOUT)
+            if not data:
+                break
+            writer.write(data)
+            await writer.drain()
+    except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError):
+        pass
+    finally:
+        try:
+            writer.write_eof()
+        except (OSError, RuntimeError):
+            pass
+
+
+async def handle_client(reader, writer):
+    global _active
+    peer = writer.get_extra_info("peername")
+    source_host = None
+    sock = None
+    up_writer = None
+    if _active >= MAX_SESSIONS:
+        try:
+            writer.close()
+        except OSError:
+            pass
+        return
+    _active += 1
+    try:
+        ok = await asyncio.wait_for(socks5_handshake(reader, writer), HANDSHAKE_TIMEOUT)
+        if not ok:
+            return
+        try:
+            host, port = await asyncio.wait_for(
+                socks5_read_request(reader), HANDSHAKE_TIMEOUT
+            )
+        except ValueError as ve:
+            code = ve.args[0] if ve.args and isinstance(ve.args[0], int) else 0x01
+            writer.write(b"\x05" + bytes([code]) + b"\x00\x01\x00\x00\x00\x00\x00\x00")
+            await writer.drain()
+            return
+
+        try:
+            source_host = pick_source()
+        except RuntimeError:
+            writer.write(b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00")
+            await writer.drain()
+            return
+
+        try:
+            sock = await open_upstream(
+                asyncio.get_running_loop(), host, port, source_host
+            )
+        except (OSError, asyncio.TimeoutError) as exc:
+            log.info("connect fail %s:%s via %s: %s", host, port,
+                     host_to_addr(source_host), exc)
+            writer.write(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")
+            await writer.drain()
+            return
+
+        bound = sock.getsockname()
+        up_reader, up_writer = await asyncio.open_connection(sock=sock)
+        sock = None  # ownership transferred to the transport
+        writer.write(b"\x05\x00\x00" + _pack_addrport(bound[0], bound[1]))
+        await writer.drain()
+
+        await asyncio.gather(pipe(reader, up_writer), pipe(up_reader, writer))
+    except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError):
+        pass
+    except Exception:
+        log.exception("unexpected error handling %s", peer)
+    finally:
+        if up_writer is not None:
+            try:
+                up_writer.close()
+            except OSError:
+                pass
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        try:
+            writer.close()
+        except OSError:
+            pass
+        if source_host is not None:
+            release_source(source_host)
+        _active -= 1
+
+
+async def main():
+    logging.basicConfig(
+        level=os.environ.get("SIXRELAY_LOGLEVEL", "INFO"),
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+    server = await asyncio.start_server(
+        handle_client, LISTEN_HOST, LISTEN_PORT, reuse_address=True
+    )
+    log.info(
+        "sixrelay listening on %s:%s, egress %s (%d reserved), session-rotating unique-per-conn",
+        LISTEN_HOST, LISTEN_PORT, SUBNET, len(_RESERVED),
+    )
+    async with server:
+        await server.serve_forever()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
