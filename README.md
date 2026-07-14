@@ -37,7 +37,7 @@ It works by binding otherwise-unassigned addresses (`net.ipv6.ip_nonlocal_bind`)
 ```bash
 git clone https://github.com/UWASDEV/Unlimited-Rotating-IPv6-Proxy-Server
 cd Unlimited-Rotating-IPv6-Proxy-Server
-sudo bash install.sh
+sudo bash install.sh --user yourusername --pass yourpassword
 ```
 
 The installer auto-detects your interface, subnet, gateway and public IPv4 (see the subnet note above), installs dependencies, sets everything up as systemd services, and runs a self-test. It prints your endpoint and credentials at the end. Re-running it keeps your existing credentials unless you pass `--user`/`--pass`.
