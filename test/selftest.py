@@ -2,14 +2,16 @@
 """Self-test for a running sixrelay instance.
 
 Starts a local source-observer echo server and drives traffic THROUGH the relay
-to verify: auth, egress source in-subnet & unassigned, session stability,
-per-connection rotation, concurrent uniqueness, and (unless disabled) real
-external egress. Exit 0 only if every enabled gate passes.
+to verify: auth, egress source in-subnet (and, in routed mode, unassigned),
+session stability, per-connection rotation, concurrent uniqueness, and (unless
+disabled) real external egress. Exit 0 only if every enabled gate passes.
 
 Env:
   RELAY_HOST (required)  RELAY_PORT (required)
   SIXRELAY_USER / SIXRELAY_PASS (required)
   SIXRELAY_SUBNET (required, e.g. 2a06:9801:6::/64)
+  SIXRELAY_MODE (default routed) - routed|address; address relaxes the
+                         'unassigned' check (sources are assigned by design)
   ECHO_ADDR (required) - a local in-subnet address the relay can reach (usually
                          the host's primary global IPv6)
   ECHO_PORT (default 45678)
@@ -29,6 +31,7 @@ RELAY_PORT = int(os.environ["RELAY_PORT"])
 USER = os.environ["SIXRELAY_USER"].encode()
 PASS = os.environ["SIXRELAY_PASS"].encode()
 SUBNET = ipaddress.IPv6Network(os.environ["SIXRELAY_SUBNET"])
+MODE = os.environ.get("SIXRELAY_MODE", "routed").strip().lower()
 ECHO_ADDR = os.environ["ECHO_ADDR"]
 ECHO_PORT = int(os.environ.get("ECHO_PORT", "45678"))
 EXTERNAL = os.environ.get("EXTERNAL", "1") == "1"
@@ -151,8 +154,14 @@ async def g_auth():
 
 async def g_source():
     s = await observed_source()
-    ok = ipaddress.IPv6Address(s) in SUBNET and not assigned_on_iface(s)
-    record("egress-source", ok, f"src={s}")
+    in_subnet = ipaddress.IPv6Address(s) in SUBNET
+    if MODE == "address":
+        # In address mode the source is assigned to the interface for the life
+        # of the connection by design (and is removed on close, so checking
+        # "unassigned" here would be racy). Only the in-subnet invariant applies.
+        record("egress-source", in_subnet, f"src={s} (address mode)")
+    else:
+        record("egress-source", in_subnet and not assigned_on_iface(s), f"src={s}")
 
 
 async def g_session():

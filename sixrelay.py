@@ -8,11 +8,13 @@ released on close. An in-use set guarantees that no two *concurrent*
 connections ever share a source address, so simultaneous connections always
 egress from distinct IPv6 addresses.
 
-Egress is IPv6-only by design. Binding a non-assigned address relies on
-net.ipv6.ip_nonlocal_bind=1 (plus IPV6_FREEBIND); the whole subnet is
-delivered locally via `ip -6 route replace local <subnet> dev <if>` and ndppd
-answers NDP for it, so return traffic reaches the bound socket without the
-address being configured on the interface.
+Egress is IPv6-only by design. Two modes (SIXRELAY_MODE):
+  routed  - bind an otherwise-unassigned address; relies on
+            net.ipv6.ip_nonlocal_bind=1 + a `local <subnet>` route + ndppd, so
+            the provider must route the whole subnet to this host.
+  address - assign the address to the interface (nodad) for the connection's
+            lifetime and remove it on close; needed on on-link providers that
+            only accept source addresses that are configured on the interface.
 
 All configuration comes from the environment (see /etc/sixrelay/sixrelay.env).
 """
@@ -21,9 +23,12 @@ import hmac
 import ipaddress
 import logging
 import os
+import re
 import secrets
+import signal
 import socket
 import struct
+import subprocess
 import sys
 
 
@@ -44,6 +49,11 @@ CONNECT_TIMEOUT = float(os.environ.get("SIXRELAY_CONNECT_TIMEOUT", "15"))
 HANDSHAKE_TIMEOUT = float(os.environ.get("SIXRELAY_HANDSHAKE_TIMEOUT", "10"))
 IDLE_TIMEOUT = float(os.environ.get("SIXRELAY_IDLE_TIMEOUT", "300"))
 MAX_SESSIONS = int(os.environ.get("SIXRELAY_MAX_SESSIONS", "2000"))
+# routed  = bind an otherwise-unassigned address (provider routes the whole /64)
+# address = assign the address to the interface for the connection's lifetime
+#           (needed on on-link providers that only accept assigned sources)
+MODE = os.environ.get("SIXRELAY_MODE", "routed").strip().lower()
+IFACE = os.environ.get("SIXRELAY_IFACE", "").strip()
 BUF = 65536
 
 IPV6_FREEBIND = getattr(socket, "IPV6_FREEBIND", 78)
@@ -51,6 +61,7 @@ IPV6_FREEBIND = getattr(socket, "IPV6_FREEBIND", 78)
 _PREFIX_INT = int(SUBNET.network_address)
 _HOST_BITS = 128 - SUBNET.prefixlen
 _HOSTMASK = (1 << _HOST_BITS) - 1 if _HOST_BITS else 0
+_PLEN = SUBNET.prefixlen
 
 
 def _parse_reserved(spec):
@@ -101,6 +112,54 @@ def release_source(host):
 
 def host_to_addr(host):
     return str(ipaddress.IPv6Address(_PREFIX_INT | (host & _HOSTMASK)))
+
+
+# ---- Address mode: assign/unassign the source on the interface --------------
+async def _ip_run(*args):
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ip", *args,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        return await proc.wait()
+    except OSError:
+        return -1
+
+
+async def assign_source(addr):
+    # rc 0 = added; 2 = already present (leaked from a prior run, treat as ours)
+    rc = await _ip_run("-6", "addr", "add", f"{addr}/{_PLEN}", "dev", IFACE, "nodad")
+    return rc in (0, 2)
+
+
+async def unassign_source(addr):
+    await _ip_run("-6", "addr", "del", f"{addr}/{_PLEN}", "dev", IFACE)
+
+
+def flush_stale_pool():
+    """Remove leftover non-reserved in-subnet addresses on the interface (from a
+    prior crash) so address-mode starts clean."""
+    try:
+        out = subprocess.run(
+            ["ip", "-6", "addr", "show", "dev", IFACE, "scope", "global"],
+            capture_output=True, text=True,
+        ).stdout
+    except OSError:
+        return
+    n = 0
+    for m in re.finditer(r"inet6 ([0-9A-Fa-f:]+)/\d+", out):
+        try:
+            a = ipaddress.IPv6Address(m.group(1))
+        except ValueError:
+            continue
+        if a in SUBNET and (int(a) & _HOSTMASK) not in _RESERVED:
+            subprocess.run(
+                ["ip", "-6", "addr", "del", f"{a}/{_PLEN}", "dev", IFACE],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            n += 1
+    if n:
+        log.info("address-mode: flushed %d stale pool address(es)", n)
 
 
 def _pack_addrport(addr, port):
@@ -222,6 +281,8 @@ async def handle_client(reader, writer):
     global _active
     peer = writer.get_extra_info("peername")
     source_host = None
+    src_addr = None
+    assigned = False
     sock = None
     up_writer = None
     if _active >= MAX_SESSIONS:
@@ -251,6 +312,16 @@ async def handle_client(reader, writer):
             writer.write(b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00")
             await writer.drain()
             return
+        src_addr = host_to_addr(source_host)
+        if MODE == "address":
+            assigned = await assign_source(src_addr)
+            if not assigned:
+                # On an on-link provider an unassigned source cannot egress;
+                # fail fast rather than attempt a doomed upstream connect.
+                log.warning("address-mode: could not assign %s on %s", src_addr, IFACE)
+                writer.write(b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00")
+                await writer.drain()
+                return
 
         try:
             sock = await open_upstream(
@@ -289,6 +360,11 @@ async def handle_client(reader, writer):
             writer.close()
         except OSError:
             pass
+        if assigned and src_addr is not None:
+            try:
+                await unassign_source(src_addr)
+            except OSError:
+                pass
         if source_host is not None:
             release_source(source_host)
         _active -= 1
@@ -299,15 +375,55 @@ async def main():
         level=os.environ.get("SIXRELAY_LOGLEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(message)s",
     )
+    if MODE not in ("routed", "address"):
+        sys.stderr.write(f"sixrelay: invalid SIXRELAY_MODE={MODE!r} (routed|address)\n")
+        raise SystemExit(2)
+    if MODE == "address":
+        if not IFACE:
+            sys.stderr.write("sixrelay: address mode requires SIXRELAY_IFACE\n")
+            raise SystemExit(2)
+        flush_stale_pool()  # clear any addresses leaked by a prior crash
     server = await asyncio.start_server(
         handle_client, LISTEN_HOST, LISTEN_PORT, reuse_address=True
     )
     log.info(
-        "sixrelay listening on %s:%s, egress %s (%d reserved), session-rotating unique-per-conn",
-        LISTEN_HOST, LISTEN_PORT, SUBNET, len(_RESERVED),
+        "sixrelay listening on %s:%s, egress %s mode=%s (%d reserved), session-rotating unique-per-conn",
+        LISTEN_HOST, LISTEN_PORT, SUBNET, MODE, len(_RESERVED),
     )
-    async with server:
-        await server.serve_forever()
+    loop = asyncio.get_running_loop()
+    stop = loop.create_future()
+
+    def _request_stop():
+        if not stop.done():
+            stop.set_result(None)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _request_stop)
+        except (NotImplementedError, RuntimeError):
+            pass  # e.g. not the main thread / unsupported platform
+
+    try:
+        await stop
+    finally:
+        # Stop accepting, then clean up immediately. We deliberately do NOT
+        # `await server.wait_closed()`: on Python 3.12+ it blocks until every
+        # in-flight proxied connection ends, which would stall systemd's stop
+        # timeout and end in SIGKILL -- skipping the flush below and leaking
+        # addresses. Closing the listener and flushing now gives a prompt, clean
+        # shutdown.
+        server.close()
+        # Cancel in-flight handlers and let them unwind so none is mid-assignment
+        # when we flush, then remove any pool addresses still on the interface so
+        # a stop/restart/uninstall leaves it clean (address mode only). The
+        # startup flush backstops the sub-millisecond orphaned-`ip add` window.
+        handlers = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        for t in handlers:
+            t.cancel()
+        if handlers:
+            await asyncio.gather(*handlers, return_exceptions=True)
+        if MODE == "address":
+            flush_stale_pool()
 
 
 if __name__ == "__main__":

@@ -1,28 +1,33 @@
 # Unlimited Rotating IPv6 Proxy Server
 
-Turn a single VPS with a routed IPv6 **/64** into a **session-based rotating IPv6 SOCKS5 proxy** — with one command.
+Turn a single VPS with a routed **or on-link** IPv6 **/64** into a **session-based rotating IPv6 SOCKS5 proxy** — with one command.
 
-Every new connection egresses from a **random** IPv6 out of the whole `/64` (18 quintillion addresses), that address stays fixed **for the lifetime of the TCP session**, and **concurrent connections always get distinct addresses**. No addresses are pre-assigned to the interface, so there is nothing to "expire", flush, or churn.
+Every new connection egresses from a **random** IPv6 out of the whole `/64` (18 quintillion addresses), that address stays fixed **for the lifetime of the TCP session**, and **concurrent connections always get distinct addresses**. No pool of addresses is pre-created and left to "expire" or churn — the source for a connection exists only while that connection is alive.
 
 ```
 client ──IPv4/SOCKS5+auth──▶ sixrelay ──IPv6──▶ target
-                              per connection: bind a random unused /64 address
+                              per connection: pick a random unused /64 address
                               (held for the session, released on close)
 ```
+
+The installer **auto-detects** which of two egress modes your provider needs (you can override with `--mode`):
+
+- **routed** — the provider routes the whole `/64` to your host. Sources are bound *without* being assigned to the interface (`ip_nonlocal_bind` + a `local <subnet>` route + `ndppd`). Nothing is ever added to the NIC.
+- **address** — the `/64` is *on-link* (a shared L2 segment where the upstream router does neighbor discovery per address). Each source is assigned to the interface (`ip -6 addr add … nodad`) for the life of its connection and removed on close.
 
 ## Why this instead of the classic 3proxy setup?
 
 The usual `ipv6-proxy-server` approach assigns thousands of individual `/128` addresses to the NIC and maps one port to each. Those addresses are not owned by the network configuration, so the network manager keeps flushing them and they "die". This project takes the opposite approach:
 
-| | Classic (per-address) | This project (routed) |
+| | Classic (per-address) | This project |
 |---|---|---|
-| Addresses on the NIC | thousands of `/128` | **none** (just your primary) |
+| Addresses on the NIC | thousands of `/128`, permanently | **none** (routed) / **one per live connection** (address) |
 | Rotation | one fixed IP per port | **random per connection**, session-stable |
 | Concurrency | one IP per port | **every concurrent connection a distinct IP** |
 | Pool size | however many you pre-created | the **entire /64** |
-| Stability | addresses get flushed / "die" | nothing to flush |
+| Stability | addresses get flushed / "die" | nothing pre-created to flush |
 
-It works by binding otherwise-unassigned addresses (`net.ipv6.ip_nonlocal_bind`), making the whole subnet locally deliverable (`ip -6 route replace local <subnet>`), and answering neighbor discovery for the subnet with `ndppd`.
+In **routed** mode it binds otherwise-unassigned addresses (`net.ipv6.ip_nonlocal_bind`), makes the whole subnet locally deliverable (`ip -6 route replace local <subnet>`), and answers neighbor discovery for the subnet with `ndppd`. In **address** mode (on-link `/64`) it instead assigns each source to the interface just for the connection's lifetime — and deliberately does *not* add a `local` route or an ndppd rule for the subnet, so it never claims addresses it isn't actively using on a shared segment. The installer picks the mode automatically.
 
 ## Requirements
 
@@ -53,6 +58,7 @@ sudo bash install.sh --yes \
 | Option | Meaning |
 |---|---|
 | `--subnet CIDR` | subnet to rotate within (default: derived from the primary address) |
+| `--mode MODE` | `routed` or `address` (default: **auto-detected** by probing egress) |
 | `--iface NAME` | interface (default: the IPv6 default-route interface) |
 | `--listen ADDR` | listen address (default: primary public IPv4, else `0.0.0.0`) |
 | `--port N` | listen port (default: `1080`) |
@@ -80,10 +86,11 @@ seq 20 | xargs -P20 -I_ curl -s -x socks5h://user:pass@SERVER_IP:1080 -6 https:/
 
 ## How it works
 
-- **sixrelay** (`/opt/sixrelay/sixrelay.py`): an asyncio SOCKS5 server. For each connection it draws a random, currently-unused host part of the subnet, binds the upstream socket to that address, and relays. An in-use set guarantees uniqueness across concurrent sessions; the address is released on close.
-- **sixrelay-net** (`/opt/sixrelay/sixrelay-net.sh`): a tiny loop that (re-)asserts the sysctls, the `local <subnet>` route, and ndppd — so the setup survives network reconfigurations and reboots.
-- **ndppd**: answers IPv6 neighbor discovery for the whole subnet. This is only needed for **on-link** subnets (where the gateway ARPs/NDPs for each address); if your provider **routes** the `/64` to your host, ndppd is not required and the installer continues even if it can't be installed. The self-test's external-egress check tells you whether return traffic actually works.
-- Configuration lives in `/etc/sixrelay/sixrelay.env`; both services read it. Edit and `systemctl restart sixrelay`.
+- **sixrelay** (`/opt/sixrelay/sixrelay.py`): an asyncio SOCKS5 server. For each connection it draws a random, currently-unused host part of the subnet, binds the upstream socket to that address, and relays. An in-use set guarantees uniqueness across concurrent sessions; the address is released on close. In **address** mode it also assigns the address to the interface before binding and removes it afterwards (and flushes any strays on startup and shutdown, so a crash or `systemctl stop` never leaves addresses behind).
+- **Mode auto-detection**: on a fresh install the installer applies the routed prerequisites and probes real egress from an unassigned in-subnet source. If that reaches the internet it chooses **routed**; otherwise it withdraws those prerequisites and probes an *assigned* source, choosing **address** if that works. A re-run keeps the mode already chosen (stored in the env file) rather than re-probing.
+- **sixrelay-net** (`/opt/sixrelay/sixrelay-net.sh`): a tiny loop that re-asserts the network prerequisites so they survive network reconfigurations and reboots. In routed mode that is the sysctls, the `local <subnet>` route and ndppd; in address mode it only suppresses duplicate-address detection (the relay manages addresses itself) and never adds a subnet-wide route or ndppd rule.
+- **ndppd** (routed mode only): answers IPv6 neighbor discovery for the whole subnet, needed when the provider treats the `/64` as on-link but routes it entirely to your host. If it can't be installed the installer continues; the self-test's external-egress check tells you whether return traffic actually works. Address mode does not use ndppd.
+- Configuration lives in `/etc/sixrelay/sixrelay.env` (including `SIXRELAY_MODE`); both services read it. Edit and `systemctl restart sixrelay`.
 
 ## Management
 
