@@ -25,6 +25,7 @@
 #   --reserved LIST   extra comma-separated addresses (or 0x-prefixed host parts) to never hand out
 #   --interval N      seconds between network-prerequisite re-assertions (default: 10)
 #   --no-test         skip the post-install self-test
+#   --no-watchdog     do not install the IPv6 gateway watchdog (installed by default)
 #   --yes             non-interactive; accept detected values
 #   --uninstall       remove everything this installer created
 #   -h, --help        show this help
@@ -34,11 +35,20 @@ PREFIX=/opt/sixrelay
 ETCDIR=/etc/sixrelay
 ENVFILE="$ETCDIR/sixrelay.env"
 SYSCTL_FILE=/etc/sysctl.d/99-sixrelay.conf
+SYSCTL_CONF_BAK=/etc/sysctl.conf.sixrelay-orig
 NDPPD_CONF=/etc/ndppd.conf
 NDPPD_BAK=/etc/ndppd.conf.sixrelay-orig
 UNIT_RELAY=/etc/systemd/system/sixrelay.service
 UNIT_NET=/etc/systemd/system/sixrelay-net.service
+WATCHDOG_SH="$PREFIX/ipv6-watchdog.sh"
+WATCHDOG_SVC=/etc/systemd/system/sixrelay-watchdog.service
+WATCHDOG_TIMER=/etc/systemd/system/sixrelay-watchdog.timer
+# legacy (superseded) watchdog paths from the first hand-rolled install
+WATCHDOG_SH_OLD=/opt/ipv6-watchdog.sh
+WATCHDOG_SVC_OLD=/etc/systemd/system/ipv6-watchdog.service
+WATCHDOG_TIMER_OLD=/etc/systemd/system/ipv6-watchdog.timer
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+UNRESOLVED=0
 
 # Wait up to 5 min for the dpkg lock: fresh Ubuntu VPSes routinely run
 # unattended-upgrades / apt-daily right after boot, which would otherwise make
@@ -48,7 +58,7 @@ APT="apt-get -o DPkg::Lock::Timeout=300"
 
 PORT=""; LISTEN=""; SUBNET=""; PLEN=""; IFACE=""; PUSER=""; PPASS=""; RESERVED_EXTRA=""
 INTERVAL=""; ASSUME_YES=0; ACTION=install; RUN_TEST=1; SUBNET_FORCED=0
-MODE=""; MODE_FORCED=0
+MODE=""; MODE_FORCED=0; WATCHDOG=1
 
 if [ -t 1 ]; then
   c_g=$'\033[32m'; c_y=$'\033[33m'; c_r=$'\033[31m'; c_b=$'\033[1m'; c_0=$'\033[0m'
@@ -74,6 +84,7 @@ while [ $# -gt 0 ]; do
     --reserved) RESERVED_EXTRA="$2"; shift 2;;
     --interval) INTERVAL="$2"; shift 2;;
     --no-test)  RUN_TEST=0; shift;;
+    --no-watchdog) WATCHDOG=0; shift;;
     --yes|-y)   ASSUME_YES=1; shift;;
     --uninstall) ACTION=uninstall; shift;;
     -h|--help)  usage;;
@@ -97,7 +108,10 @@ if [ "$ACTION" = uninstall ]; then
     U_RESERVED=$(sed -n 's/^SIXRELAY_RESERVED=//p' "$ENVFILE" | tail -1)
   fi
   systemctl disable --now sixrelay.service sixrelay-net.service 2>/dev/null || true
-  rm -f "$UNIT_RELAY" "$UNIT_NET"
+  systemctl disable --now sixrelay-watchdog.timer ipv6-watchdog.timer 2>/dev/null || true
+  rm -f "$UNIT_RELAY" "$UNIT_NET" \
+        "$WATCHDOG_SVC" "$WATCHDOG_TIMER" "$WATCHDOG_SH" \
+        "$WATCHDOG_SVC_OLD" "$WATCHDOG_TIMER_OLD" "$WATCHDOG_SH_OLD"
   systemctl daemon-reload 2>/dev/null || true
   if [ -n "$U_SUBNET" ] && [ -n "$U_IFACE" ]; then
     ip -6 route del local "$U_SUBNET" dev "$U_IFACE" 2>/dev/null || true
@@ -152,6 +166,10 @@ PY
     systemctl disable --now ndppd 2>/dev/null || true
     rm -f "$NDPPD_CONF"    # was created by this installer
   fi
+  if [ -f "$SYSCTL_CONF_BAK" ]; then
+    cp -a "$SYSCTL_CONF_BAK" /etc/sysctl.conf && rm -f "$SYSCTL_CONF_BAK"
+    log "restored /etc/sysctl.conf from backup"
+  fi
   rm -rf "$PREFIX" "$ETCDIR" "$SYSCTL_FILE"
   log "Done. (ndppd package left installed; runtime sysctls clear on reboot.)"
   exit 0
@@ -178,9 +196,12 @@ det_iface() {
 }
 det_gw()   { ip -6 route show default 2>/dev/null | awk '{for(x=1;x<=NF;x++) if($x=="via"){print $(x+1); exit}}' || true; }
 det_prim6() {
+  # Exclude 'nodad' addresses: in address mode the relay assigns per-connection
+  # pool addresses with `ip addr add ... nodad`, so on a re-run of a live box they
+  # would otherwise be mistaken for the primary (and then flushed / not reserved).
   local a
-  a=$(ip -6 addr show dev "$1" scope global 2>/dev/null | awk '/inet6/&&!/temporary/&&!/deprecated/{print $2; exit}' || true)
-  [ -n "$a" ] || a=$(ip -6 addr show dev "$1" scope global 2>/dev/null | awk '/inet6/{print $2; exit}' || true)
+  a=$(ip -6 addr show dev "$1" scope global 2>/dev/null | awk '/inet6/&&!/temporary/&&!/deprecated/&&!/nodad/{print $2; exit}' || true)
+  [ -n "$a" ] || a=$(ip -6 addr show dev "$1" scope global 2>/dev/null | awk '/inet6/&&!/nodad/{print $2; exit}' || true)
   printf '%s' "$a"
 }
 det_ipv4() { ip -4 addr show dev "$1" scope global 2>/dev/null | awk '/inet /{print $2; exit}' | cut -d/ -f1 || true; }
@@ -383,31 +404,34 @@ finally:
 PY
 }
 
+# determine_mode -> echoes: address | routed | address-default.
+# Address-first: probe an interface-assigned source first. Address mode works on
+# BOTH routed and on-link /64s (the kernel answers NDP for an assigned address)
+# and carries none of the routed NDP hazards (forwarding, subnet-wide local route,
+# ndppd), so it is the safer default; only if the assigned-source probe fails do we
+# apply the routed prerequisites and probe an unassigned source. Every helper's
+# stdout is redirected to stderr so `$(determine_mode)` captures only the token.
+determine_mode() {
+  if probe_egress address >&2; then echo address; return; fi
+  apply_routed_live >&2; sleep 2          # let ndppd settle before the routed probe
+  if probe_egress routed 4 >&2; then echo routed; return; fi
+  remove_routed_live >&2; echo address-default
+}
+
 # ---------- determine egress mode --------------------------------------------
 if [ "$MODE_FORCED" -eq 1 ]; then
   log "Egress mode: $MODE (specified)."
 else
-  log "Detecting egress mode (routed vs address)..."
-  # Apply routed prerequisites, let ndppd settle, then a single tightly-bounded
-  # probe. The routed setup (local route + ndppd static rule) is briefly live on
-  # the segment during this window; on a shared on-link /64 (where the routed
-  # probe fails anyway) it is withdrawn immediately below, keeping exposure short.
-  apply_routed_live
-  sleep 2
-  if probe_egress routed 4; then
-    MODE=routed
-    log "  -> routed: an unassigned in-subnet source reaches the internet."
-  else
-    remove_routed_live
-    if probe_egress address; then
-      MODE=address
-      log "  -> address: only interface-assigned sources egress (on-link /64)."
-    else
+  log "Detecting egress mode (address-first)..."
+  MODE="$(determine_mode)"
+  case "$MODE" in
+    address) log "  -> address: an interface-assigned source reaches the internet." ;;
+    routed)  log "  -> routed: an unassigned in-subnet source reaches the internet." ;;
+    address-default)
       MODE=address
       warn "could not confirm IPv6 egress in either mode; defaulting to address."
-      warn "the self-test below will show whether egress works (verify provider IPv6 routing if it fails)."
-    fi
-  fi
+      warn "the self-test below will show whether egress works (verify provider IPv6 routing if it fails)." ;;
+  esac
 fi
 
 # ---------- lay down files ---------------------------------------------------
@@ -421,6 +445,7 @@ umask 077
 cat > "$ENVFILE" <<EOF
 SIXRELAY_IFACE=$IFACE
 SIXRELAY_SUBNET=$SUBNET
+SIXRELAY_GW=$GW
 SIXRELAY_MODE=$MODE
 SIXRELAY_LISTEN_HOST=$LISTEN
 SIXRELAY_LISTEN_PORT=$PORT
@@ -442,19 +467,86 @@ net.ipv6.conf.all.proxy_ndp=1
 net.ipv6.conf.$IFACE.proxy_ndp=1
 net.ipv6.conf.$IFACE.accept_dad=0
 net.ipv6.conf.$IFACE.dad_transmits=0
+# the relay churns many neighbours; keep the table well above default
+net.ipv6.neigh.default.gc_thresh1=4096
+net.ipv6.neigh.default.gc_thresh2=8192
+net.ipv6.neigh.default.gc_thresh3=16384
 EOF
 else
   cat > "$SYSCTL_FILE" <<EOF
 # Managed by Unlimited Rotating IPv6 Proxy Server (address mode)
-# On-link /64: each source is assigned to the interface, so ip_nonlocal_bind,
-# forwarding and proxy_ndp are intentionally omitted (proxying NDP for the whole
-# subnet would hijack a shared segment). DAD is suppressed so per-connection
-# assignment is instant and warning-free.
+# On-link/shared /64: each source is assigned to the interface, so forwarding,
+# proxy_ndp and ip_nonlocal_bind are explicitly DISABLED here (proxying NDP for
+# the whole subnet would hijack a shared segment; forwarding=1 also flips
+# accept_ra to 0 and can cost a SLAAC box its default route). Setting them to 0
+# (not just omitting) also resets a prior routed-mode install and persists across
+# reboot. DAD is suppressed so per-connection assignment is instant.
+net.ipv6.conf.all.forwarding=0
+net.ipv6.conf.default.forwarding=0
+net.ipv6.conf.$IFACE.forwarding=0
+net.ipv6.conf.all.proxy_ndp=0
+net.ipv6.conf.$IFACE.proxy_ndp=0
+net.ipv6.ip_nonlocal_bind=0
+net.ipv6.conf.$IFACE.accept_ra=1
 net.ipv6.conf.$IFACE.accept_dad=0
 net.ipv6.conf.$IFACE.dad_transmits=0
+net.ipv6.neigh.default.gc_thresh1=4096
+net.ipv6.neigh.default.gc_thresh2=8192
+net.ipv6.neigh.default.gc_thresh3=16384
 EOF
 fi
 sysctl --system >/dev/null 2>&1 || true
+
+# ---------- self-sufficiency: prove address-mode hardening persists ----------
+# After sysctl --system (which applied SYSCTL_FILE in boot order), the runtime
+# /proc values reflect FILE application. If a later-sorting source still forces
+# forwarding/proxy_ndp=1, it wins here exactly as it would at boot -- catch it now.
+proc_routed_on() {   # exit 0 if any ipv6 forwarding/proxy_ndp is currently 1
+  local k v
+  for k in all/forwarding default/forwarding "$IFACE/forwarding" all/proxy_ndp "$IFACE/proxy_ndp"; do
+    v=$(cat "/proc/sys/net/ipv6/conf/$k" 2>/dev/null || echo 0)
+    [ "$v" = 1 ] && return 0
+  done
+  return 1
+}
+# scan_sysctl_conflicts [ROOT] -> "file:line:content" for uncommented lines that
+# set ipv6 forwarding/proxy_ndp/ip_nonlocal_bind =1, de-duped by real path.
+# ROOT is a prefix for the four sysctl trees (default: real /), so the logic is
+# unit-testable against a seeded temp tree.
+scan_sysctl_conflicts() {
+  local root="${1:-}" f rp; declare -A seen=()
+  for f in "$root/etc/sysctl.conf" "$root"/etc/sysctl.d/*.conf \
+           "$root"/run/sysctl.d/*.conf "$root"/usr/lib/sysctl.d/*.conf; do
+    [ -e "$f" ] || continue
+    rp=$(readlink -f "$f" 2>/dev/null || echo "$f")
+    [ -n "${seen[$rp]:-}" ] && continue
+    seen[$rp]=1
+    grep -nHE '^[[:space:]]*net\.ipv6\.(conf\.[^=]*\.(forwarding|proxy_ndp)|ip_nonlocal_bind)[[:space:]]*=[[:space:]]*1([[:space:]]|$)' "$f" 2>/dev/null || true
+  done
+}
+if [ "$MODE" = address ] && proc_routed_on; then
+  hits=$(scan_sysctl_conflicts)
+  if [ -z "$hits" ]; then
+    UNRESOLVED=1
+    warn "forwarding/proxy_ndp is 1 at runtime but no sysctl line sets it; a reboot may re-enable it."
+  else
+    real_conf=$(readlink -f /etc/sysctl.conf 2>/dev/null || echo /etc/sysctl.conf)
+    owned=0
+    while IFS= read -r line; do
+      [ -z "$line" ] && continue
+      cf="${line%%:*}"; crf=$(readlink -f "$cf" 2>/dev/null || echo "$cf")
+      if [ "$crf" = "$real_conf" ]; then owned=1
+      else UNRESOLVED=1; warn "conflicting sysctl in $cf -> ${line#*:}"; warn "  comment/remove it so forwarding/proxy_ndp stays 0 across reboot."; fi
+    done <<<"$hits"
+    if [ "$owned" -eq 1 ]; then
+      [ -f "$SYSCTL_CONF_BAK" ] || cp -a "$real_conf" "$SYSCTL_CONF_BAK"
+      sed -i -E 's/^([[:space:]]*net\.ipv6\.(conf\.[^=]*\.(forwarding|proxy_ndp)|ip_nonlocal_bind)[[:space:]]*=[[:space:]]*1.*)$/# sixrelay-disabled: \1/' "$real_conf"
+      sysctl --system >/dev/null 2>&1 || true
+      log "neutralised routed sysctls in /etc/sysctl.conf (backup: $SYSCTL_CONF_BAK)"
+    fi
+    proc_routed_on && { UNRESOLVED=1; warn "forwarding/proxy_ndp still 1 after neutralising owned sources; see the warnings above."; }
+  fi
+fi
 
 # ndppd config: routed mode only. Address mode must NOT proxy NDP for the subnet.
 if [ "$MODE" = routed ] && [ "$NDPPD_OK" -eq 1 ]; then
@@ -505,17 +597,96 @@ NoNewPrivileges=yes
 WantedBy=multi-user.target
 EOF
 
+# ---------- IPv6 gateway watchdog (default on; --no-watchdog to skip) ---------
+# supersede any legacy hand-rolled watchdog installed before this lived here
+if [ -e "$WATCHDOG_SH_OLD" ] || [ -e "$WATCHDOG_TIMER_OLD" ]; then
+  systemctl disable --now ipv6-watchdog.timer >/dev/null 2>&1 || true
+  rm -f "$WATCHDOG_SH_OLD" "$WATCHDOG_SVC_OLD" "$WATCHDOG_TIMER_OLD"
+fi
+if [ "$WATCHDOG" -eq 1 ]; then
+  cat > "$WATCHDOG_SH" <<'WDEOF'
+#!/bin/bash
+# sixrelay IPv6 gateway watchdog. Providers that send no Router Advertisements make
+# the static default route + a resolvable gateway neighbour the single point of
+# failure; on TOTAL IPv6 loss this flushes+re-probes the gateway neighbour and
+# restores the default route only if it went missing. No-op when healthy.
+set -u
+ENV=/etc/sixrelay/sixrelay.env
+[ -r "$ENV" ] && . "$ENV" 2>/dev/null
+IFACE="${SIXRELAY_IFACE:-}"
+log(){ logger -t sixrelay-watchdog -- "$*"; }
+# health-check the gateway from the LIVE default route; fall back to env for repair
+set -- $(ip -6 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++){if($i=="via")g=$(i+1); if($i=="dev")d=$(i+1)}} END{if(g)print g, d}')
+GW="${1:-}"; GWDEV="${2:-$IFACE}"
+[ -z "$GW" ] && { GW="${SIXRELAY_GW:-}"; GWDEV="${IFACE:-}"; }
+if [ -z "$GW" ] || [ -z "$GWDEV" ]; then log "no IPv6 default route/gateway; watchdog idle"; exit 0; fi
+case "$GW" in fe80:*) PGW="$GW%$GWDEV";; *) PGW="$GW";; esac
+EXT="2606:4700:4700::1111 2001:4860:4860::8888"
+gw_ok=1; ping6 -c1 -w2 "$PGW" >/dev/null 2>&1 || gw_ok=0
+ext_ok=0
+for e in $EXT; do curl -6 -sk --max-time 5 -o /dev/null "https://[$e]/" 2>/dev/null && { ext_ok=1; break; }; done
+if [ "$ext_ok" -eq 0 ]; then
+  if [ "$gw_ok" -eq 1 ]; then log "external IPv6 egress DOWN, gateway OK -- possible provider null-route; not acting"
+  else log "external IPv6 egress DOWN and gateway unreachable -- recovering"; fi
+fi
+if [ "$gw_ok" -eq 0 ] && [ "$ext_ok" -eq 0 ]; then
+  ip -6 neigh del "$GW" dev "$GWDEV" 2>/dev/null
+  ping6 -c1 -w2 "$PGW" >/dev/null 2>&1
+  if ! ip -6 route show default 2>/dev/null | grep -q "via $GW"; then
+    log "default route missing -- restoring via $GW dev $GWDEV"
+    ip -6 route replace default via "$GW" dev "$GWDEV" metric 1024 2>/dev/null
+  fi
+  for e in $EXT; do curl -6 -sk --max-time 5 -o /dev/null "https://[$e]/" 2>/dev/null && { log "recovery OK -- external egress restored"; exit 0; }; done
+  log "recovery FAILED -- external egress still down"
+fi
+exit 0
+WDEOF
+  chmod 0755 "$WATCHDOG_SH"
+  cat > "$WATCHDOG_SVC" <<EOF
+[Unit]
+Description=sixrelay IPv6 gateway watchdog (recover from total IPv6 loss)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$WATCHDOG_SH
+EOF
+  cat > "$WATCHDOG_TIMER" <<'EOF'
+[Unit]
+Description=Run the sixrelay IPv6 gateway watchdog every 30s
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=30
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
+EOF
+else
+  systemctl disable --now sixrelay-watchdog.timer >/dev/null 2>&1 || true
+  rm -f "$WATCHDOG_SH" "$WATCHDOG_SVC" "$WATCHDOG_TIMER"
+fi
+
 # ---------- start services ---------------------------------------------------
 log "Starting services..."
 systemctl daemon-reload
+if [ "$WATCHDOG" -eq 1 ]; then
+  systemctl enable sixrelay-watchdog.timer >/dev/null 2>&1 || true
+  systemctl restart sixrelay-watchdog.timer >/dev/null 2>&1 || warn "could not start sixrelay-watchdog.timer"
+fi
 if [ "$MODE" = routed ] && [ "$NDPPD_OK" -eq 1 ]; then
   systemctl enable ndppd >/dev/null 2>&1 || true
   systemctl restart ndppd >/dev/null 2>&1 || true
 elif [ "$MODE" = address ]; then
   systemctl disable --now ndppd >/dev/null 2>&1 || true   # no NDP proxying on-link
 fi
-systemctl enable --now sixrelay-net.service >/dev/null 2>&1 || die "failed to start sixrelay-net.service (journalctl -u sixrelay-net)"
-systemctl enable --now sixrelay.service     >/dev/null 2>&1 || die "failed to start sixrelay.service (journalctl -u sixrelay)"
+# enable (boot symlinks) + restart: restart also STARTS a stopped unit and, unlike
+# `enable --now`, actually restarts an already-running one so a re-run applies changes.
+systemctl enable sixrelay-net.service sixrelay.service >/dev/null 2>&1 || true
+systemctl restart sixrelay-net.service >/dev/null 2>&1 || die "failed to (re)start sixrelay-net.service (journalctl -u sixrelay-net)"
+systemctl restart sixrelay.service     >/dev/null 2>&1 || die "failed to (re)start sixrelay.service (journalctl -u sixrelay)"
 
 # ---------- self-test --------------------------------------------------------
 TEST_RC=0
@@ -539,6 +710,15 @@ else
   echo    "Check:  journalctl -u sixrelay -n 50 --no-pager"
   [ "$NDPPD_OK" -eq 0 ] && echo "Note: ndppd is not installed; on-link subnets require it."
 fi
+if [ "$MODE" = address ]; then
+  if [ "$UNRESOLVED" -eq 0 ]; then
+    echo -e "${c_g}No reboot required${c_0} - address-mode hardening is live and persists across reboot."
+  else
+    echo -e "${c_y}WARNING${c_0}: a conflicting sysctl source still enables forwarding/proxy_ndp (see warnings above)."
+    echo    "  Comment/remove those line(s), or the routed setting returns on the next reboot."
+  fi
+fi
+[ "$WATCHDOG" -eq 1 ] && echo "IPv6 gateway watchdog active (logs: journalctl -t sixrelay-watchdog)."
 cat <<EOF
 
   ${c_b}Endpoint${c_0}  socks5://$PUSER:$PPASS@$LISTEN:$PORT

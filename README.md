@@ -65,6 +65,7 @@ sudo bash install.sh --yes \
 | `--user` / `--pass` | SOCKS5 credentials (default: randomly generated) |
 | `--reserved LIST` | extra comma-separated addresses to never hand out (bare numbers are decimal host parts; use full addresses or `0x…`) |
 | `--no-test` | skip the post-install self-test |
+| `--no-watchdog` | do not install the IPv6 gateway watchdog (installed by default) |
 | `--yes` | accept detected values, non-interactive |
 | `--uninstall` | remove everything the installer created |
 
@@ -89,7 +90,9 @@ seq 20 | xargs -P20 -I_ curl -s -x socks5h://user:pass@SERVER_IP:1080 https://if
 ## How it works
 
 - **sixrelay** (`/opt/sixrelay/sixrelay.py`): an asyncio SOCKS5 server. For each connection it draws a random, currently-unused host part of the subnet, binds the upstream socket to that address, and relays. An in-use set guarantees uniqueness across concurrent sessions; the address is released on close. In **address** mode it also assigns the address to the interface before binding and removes it afterwards (and flushes any strays on startup and shutdown, so a crash or `systemctl stop` never leaves addresses behind).
-- **Mode auto-detection**: on a fresh install the installer applies the routed prerequisites and probes real egress from an unassigned in-subnet source. If that reaches the internet it chooses **routed**; otherwise it withdraws those prerequisites and probes an *assigned* source, choosing **address** if that works. A re-run keeps the mode already chosen (stored in the env file) rather than re-probing.
+- **Mode auto-detection (address-first)**: on a fresh install the installer first probes real egress from an *interface-assigned* source. If that reaches the internet it chooses **address** — the safer default, since it works on both routed and on-link `/64`s and carries none of the routed NDP hazards. Only if the assigned-source probe fails does it apply the routed prerequisites and probe an *unassigned* source, choosing **routed** if that works. A re-run keeps the mode already chosen (stored in the env file) rather than re-probing.
+- **Self-sufficient (no reboot)**: in address mode the installer explicitly sets `forwarding`/`proxy_ndp`/`ip_nonlocal_bind` to `0` and verifies at runtime that no other sysctl source (including `/etc/sysctl.conf`, `/run/sysctl.d`, `/usr/lib/sysctl.d`) forces them back to `1`; conflicting lines it owns are commented out (with a backup) so the hardening persists across reboot without one. It also raises the IPv6 neighbour table thresholds, since the relay churns many neighbours.
+- **IPv6 gateway watchdog** (`/opt/sixrelay/ipv6-watchdog.sh` + `sixrelay-watchdog.timer`, every 30s; `--no-watchdog` to skip): providers that send no Router Advertisements make the static default route + a resolvable gateway neighbour the single point of failure. On *total* IPv6 loss the watchdog flushes and re-probes the gateway neighbour and restores the default route if it went missing; it is a no-op when healthy and logs to `journalctl -t sixrelay-watchdog`.
 - **sixrelay-net** (`/opt/sixrelay/sixrelay-net.sh`): a tiny loop that re-asserts the network prerequisites so they survive network reconfigurations and reboots. In routed mode that is the sysctls, the `local <subnet>` route and ndppd; in address mode it only suppresses duplicate-address detection (the relay manages addresses itself) and never adds a subnet-wide route or ndppd rule.
 - **ndppd** (routed mode only): answers IPv6 neighbor discovery for the whole subnet, needed when the provider treats the `/64` as on-link but routes it entirely to your host. If it can't be installed the installer continues; the self-test's external-egress check tells you whether return traffic actually works. Address mode does not use ndppd.
 - Configuration lives in `/etc/sixrelay/sixrelay.env` (including `SIXRELAY_MODE`); both services read it. Edit and `systemctl restart sixrelay`.
@@ -115,7 +118,7 @@ python3 /opt/sixrelay/test/selftest.py   # re-run gates (needs env, see install 
 sudo bash install.sh --uninstall
 ```
 
-Removes the services, files, routes and sysctl drop-in. The `ndppd` package is left installed; runtime sysctls clear on reboot.
+Removes the services, files, routes, sysctl drop-in and the gateway watchdog, and restores `/etc/sysctl.conf` if the installer had edited it. The `ndppd` package is left installed; runtime sysctls clear on reboot.
 
 ## License
 
