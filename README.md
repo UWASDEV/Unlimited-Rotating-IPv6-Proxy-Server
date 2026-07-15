@@ -74,12 +74,14 @@ Point any SOCKS5 client at the endpoint. Each connection gets its own IPv6:
 
 ```bash
 # each request → a different source IPv6
-curl -x socks5h://user:pass@SERVER_IP:1080 -6 https://ifconfig.co
-curl -x socks5h://user:pass@SERVER_IP:1080 -6 https://ifconfig.co
+curl -x socks5h://user:pass@SERVER_IP:1080 https://ifconfig.co
+curl -x socks5h://user:pass@SERVER_IP:1080 https://ifconfig.co
 
 # 20 concurrent requests → 20 distinct source IPv6 addresses
-seq 20 | xargs -P20 -I_ curl -s -x socks5h://user:pass@SERVER_IP:1080 -6 https://ifconfig.co
+seq 20 | xargs -P20 -I_ curl -s -x socks5h://user:pass@SERVER_IP:1080 https://ifconfig.co
 ```
+
+> Don't add curl's `-6` here: `SERVER_IP` is the proxy's (usually IPv4) address, and `-6` forces curl to reach the *proxy* over IPv6, so it fails to connect before any traffic flows. Egress is IPv6 regardless — the proxy resolves the target (`socks5h`) and has only an IPv6 upstream.
 
 - Protocol: **SOCKS5** (TCP `CONNECT`), username/password auth.
 - Egress is **IPv6-only** (targets must have an AAAA record). IPv4-only targets are not reachable.

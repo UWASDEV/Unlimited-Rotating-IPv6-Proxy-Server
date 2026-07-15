@@ -549,6 +549,6 @@ cat <<EOF
   ${c_b}Config${c_0}    $ENVFILE   (edit then: systemctl restart sixrelay)
   ${c_b}Remove${c_0}    sudo bash install.sh --uninstall
 
-  Test it:  curl -x socks5h://$PUSER:$PPASS@$LISTEN:$PORT -6 https://ifconfig.co
+  Test it:  curl -x socks5h://$PUSER:$PPASS@$LISTEN:$PORT https://ifconfig.co
 EOF
 exit "$TEST_RC"
